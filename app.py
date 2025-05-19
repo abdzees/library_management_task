@@ -1,123 +1,184 @@
 from flask import Flask, render_template, jsonify, request
-import configparser
-import requests
-import logging
+import psycopg2
 from flask_cors import CORS
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__, static_url_path='/static', static_folder='static')
 CORS(app)
 
-# Configure logging to DEBUG level for detailed logs
-logging.basicConfig(
-    level=logging.DEBUG,  # Changed from INFO to DEBUG
-    format='%(asctime)s %(levelname)s %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
+# Database connection
+def get_db_connection():
+    conn = psycopg2.connect(
+        dbname='library_db',
+        user='postgres',
+        password='3911',
+        host='localhost',
+        port='5432'
+    )
+    return conn
 
-# Load the configuration from the config.ini file
-config = configparser.ConfigParser()
-config.read('config.ini')
-
-# Get the API key and URL from the configuration
-try:
-    GEMINI_API_KEY = config.get('API', 'GEMINI_API_KEY')
-    GEMINI_API_URL = config.get('API', 'GEMINI_API_URL')
-    logging.info("Gemini API configuration loaded successfully.")
-except Exception as e:
-    logging.error("Error reading config.ini: %s", e)
-    GEMINI_API_KEY = None
-    GEMINI_API_URL = None
-
-# Route to serve the home page
 @app.route('/')
 def home():
     return render_template('index.html')
 
-# Route to serve viewer.html
-@app.route('/viewer.html')
-def viewer():
-    return render_template('viewer.html')
-
-# API route to fetch description from Gemini API
-@app.route('/api/description', methods=['GET'])
-def get_description():
-    entity_name = request.args.get('name')
-    logging.debug(f"Received request for entity name: {entity_name}")  # Changed to DEBUG
-
-    if not entity_name:
-        logging.warning("Missing entity name in request.")
-        return jsonify({'error': 'Missing entity name'}), 400
-
-    if not GEMINI_API_URL or not GEMINI_API_KEY:
-        logging.error("Gemini API configuration missing.")
-        return jsonify({'error': 'Server configuration error'}), 500
-
-    # Prepare the JSON payload with explicit instructions
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": (
-                            f"Provide a detailed description of '{entity_name}'"
-                            "If it is a book include information about the setting, characters, themes, key concepts, and its influence. "
-                            "Do not include any concluding remarks or questions."
-                            "Do not mention any Note at the end about not including concluding remarks or questions."
-                        )
-                    }
-                ]
-            }
-        ]
-    }
-
-    # Construct the API URL with the API key as a query parameter
-    api_url_with_key = f"{GEMINI_API_URL}?key={GEMINI_API_KEY}"
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    # Log the API URL and payload for debugging
-    logging.debug(f"API URL: {api_url_with_key}")
-    logging.debug(f"Payload: {payload}")
-
+# Get all books and their current status
+@app.route('/api/books', methods=['GET'])
+def get_books():
     try:
-        # Make the POST request to the Gemini API
-        response = requests.post(
-            api_url_with_key,  # Include the API key in the URL
-            headers=headers,
-            json=payload,
-            timeout=10  # seconds
-        )
-        logging.debug(f"Gemini API response status: {response.status_code}")  # Changed to DEBUG
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 
+                b.id AS book_id,
+                b.title AS book_title,
+                a.name AS author_name,
+                p.name AS publisher_name,
+                g.name AS genre_name,
+                br.borrow_date,
+                br.return_date,
+                c.name AS customer_name,
+                br.state
+            FROM book b
+            JOIN author a ON b.authorid = a.id
+            JOIN publisher p ON b.publisherid = p.id
+            JOIN genre g ON b.genreid = g.id
+            LEFT JOIN borrowed br ON b.id = br.bookid AND br.return_date IS NULL
+            LEFT JOIN customer c ON br.customerid = c.id
+        ''')
+        books = cursor.fetchall()
+        cursor.close()
+        conn.close()
 
-        if response.status_code != 200:
-            logging.error(f"Failed to fetch description from Gemini API. Status code: {response.status_code}")
-            logging.error(f"Response content: {response.text}")
-            return jsonify({
-                'error': 'Failed to fetch description from Gemini API',
-                'status_code': response.status_code,
-                'response': response.text
-            }), 500
+        books = [
+            {
+                'book_id': book[0],
+                'book_title': book[1],
+                'author_name': book[2],
+                'publisher_name': book[3],
+                'genre_name': book[4],
+                'borrow_date': book[5],
+                'return_date': book[6],
+                'customer_name': book[7],
+                'state': book[8] if book[8] else 'Available'
+            }
+            for book in books
+        ]
 
-        response_data = response.json()
-        # Extract the description from the response
-        description = response_data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', 'No description available.')
-        logging.debug(f"Fetched description: {description}")  # Changed to DEBUG
-
-        return jsonify({'description': description})
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Exception during Gemini API request: {e}")
-        return jsonify({'error': 'Failed to connect to Gemini API', 'message': str(e)}), 500
-    except ValueError as e:
-        logging.error(f"JSON decoding failed: {e}")
-        return jsonify({'error': 'Invalid JSON response from Gemini API', 'message': str(e)}), 500
+        return jsonify(books), 200
     except Exception as e:
-        logging.exception(f"Unexpected error: {e}")
-        return jsonify({'error': 'An unexpected error occurred', 'message': str(e)}), 500
+        print(f"Exception: {e}")
+        return jsonify({'error': 'Failed to fetch books, please try again later.'}), 500
+
+# Borrow a book
+@app.route('/api/borrow', methods=['POST'])
+def borrow_book():
+    try:
+        data = request.json
+        print("Received borrow request:", data)
+
+        book_id = data.get('book_id')
+        customer_name = data.get('customer_name')
+        borrow_date = data.get('borrow_date')
+
+        if not book_id or not customer_name or not borrow_date:
+            return jsonify({'error': 'Missing data in request'}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Check if the book exists and is available
+        cursor.execute('''
+            SELECT b.id, br.state
+            FROM book b
+            LEFT JOIN borrowed br ON b.id = br.bookid AND br.return_date IS NULL
+            WHERE b.id = %s
+        ''', (book_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            return jsonify({'error': 'Book not found'}), 404
+
+        if result['state'] == 'Borrowed':
+            return jsonify({'error': 'Book is already borrowed'}), 409
+
+        # Check if customer exists
+        cursor.execute('SELECT * FROM customer WHERE name = %s', (customer_name,))
+        customer = cursor.fetchone()
+
+        if not customer:
+            cursor.execute(
+                'INSERT INTO customer (name) VALUES (%s) RETURNING id',
+                (customer_name,))
+            customer_id = cursor.fetchone()['id']
+        else:
+            customer_id = customer['id']
+
+        # Insert borrow record
+        cursor.execute('''
+            INSERT INTO borrowed (bookid, customerid, state, borrow_date)
+            VALUES (%s, %s, 'Borrowed', %s)
+        ''', (book_id, customer_id, borrow_date))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return jsonify({'message': 'Book borrowed successfully!'}), 200
+
+    except Exception as e:
+        print(f"Exception during borrow: {e}")
+        return jsonify({'error': 'Failed to borrow book, please try again later.'}), 500
+
+# Return a book
+@app.route('/api/return', methods=['POST'])
+def return_book():
+    try:
+        data = request.json
+        book_id = data.get('book_id')
+        return_date = data.get('return_date')
+
+        if not book_id or not return_date:
+            return jsonify({'error': 'Missing data in request'}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Update borrowed record
+        cursor.execute('''
+            UPDATE borrowed
+            SET return_date = %s, state = 'Returned'
+            WHERE bookid = %s AND state = 'Borrowed' AND return_date IS NULL
+        ''', (return_date, book_id))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return jsonify({'message': 'Book returned successfully!'}), 200
+
+    except Exception as e:
+        print(f"Exception: {e}")
+        return jsonify({'error': 'Failed to return book, please try again later.'}), 500
+
+# Clear all borrowing records
+@app.route('/api/clear', methods=['DELETE'])
+def clear_all():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Clear borrowed table
+        cursor.execute('TRUNCATE TABLE borrowed')
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return jsonify({'message': 'All records cleared successfully!'}), 200
+
+    except Exception as e:
+        print(f"Exception: {e}")
+        return jsonify({'error': 'Failed to clear records, please try again later.'}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
